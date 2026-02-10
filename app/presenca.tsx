@@ -14,22 +14,22 @@ import {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { CameraType, CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
+import { useRouter } from "expo-router";
+
+const BACKEND_URL = "http://192.168.2.105:3333";
 
 export default function Presenca() {
   const cameraRef = useRef<CameraView | null>(null);
-
+  const router = useRouter();
   const [permission, requestPermission] = useCameraPermissions();
   const [foto, setFoto] = useState<string | null>(null);
-
   const [justificar, setJustificar] = useState(false);
   const [motivo, setMotivo] = useState("");
-
   const [cameraTipo, setCameraTipo] = useState<CameraType>("front");
   const [tipoRegistro, setTipoRegistro] = useState<"entrada" | "saida">(
     "entrada",
   );
   const [carregando, setCarregando] = useState(true);
-
   const [localizacao, setLocalizacao] = useState<any>(null);
   const [endereco, setEndereco] = useState<string | null>(null);
 
@@ -37,25 +37,34 @@ export default function Presenca() {
     return new Date().toISOString().split("T")[0];
   }
 
-  /**
-   * Verifica se já existe registro hoje
-   */
   const verificarRegistro = useCallback(async () => {
-    const registro = await AsyncStorage.getItem("registro_hoje");
-
-    if (!registro) {
-      setTipoRegistro("entrada");
-    } else {
-      const dados = JSON.parse(registro);
-
-      if (dados.data === hoje() && dados.tipo === "entrada") {
-        setTipoRegistro("saida");
-      } else {
+    try {
+      const usuarioStr = await AsyncStorage.getItem("usuario");
+      if (!usuarioStr) {
         setTipoRegistro("entrada");
+        return;
       }
-    }
 
-    setCarregando(false);
+      const usuario = JSON.parse(usuarioStr);
+
+      const response = await fetch(
+        `${BACKEND_URL}/presenca/${usuario.id}?date=${hoje()}`,
+      );
+
+      const dados = await response.json();
+
+      const entradaExiste = dados.some((r: any) => r.tipo === "entrada");
+      const saidaExiste = dados.some((r: any) => r.tipo === "saida");
+
+      if (!entradaExiste) setTipoRegistro("entrada");
+      else if (!saidaExiste) setTipoRegistro("saida");
+      else setTipoRegistro("entrada"); // apenas visual
+    } catch (err) {
+      console.error(err);
+      setTipoRegistro("entrada");
+    } finally {
+      setCarregando(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -64,20 +73,15 @@ export default function Presenca() {
     Location.requestForegroundPermissionsAsync();
   }, [requestPermission, verificarRegistro]);
 
-  /**
-   * Converte latitude/longitude em endereço aproximado
-   */
   async function converterEndereco(latitude: number, longitude: number) {
     try {
       const resposta = await Location.reverseGeocodeAsync({
         latitude,
         longitude,
       });
-
-      if (resposta.length === 0) return null;
+      if (!resposta.length) return null;
 
       const lugar = resposta[0];
-
       return `${lugar.street || ""} ${lugar.name || ""} - ${
         lugar.subregion || lugar.district || ""
       }, ${lugar.city || ""} - ${lugar.region || ""}`;
@@ -86,15 +90,12 @@ export default function Presenca() {
     }
   }
 
-  /**
-   * Tirar foto + pegar localização
-   */
   async function registrarPresenca() {
     if (!cameraRef.current) return;
 
     const photo = await cameraRef.current.takePictureAsync({
       quality: 0.5,
-      mirror: false, // não inverte eixo
+      mirror: false,
     });
 
     const location = await Location.getCurrentPositionAsync({
@@ -107,31 +108,53 @@ export default function Presenca() {
     );
 
     setFoto(photo.uri);
-    setLocalizacao({
-      latitude: location.coords.latitude,
-      longitude: location.coords.longitude,
-      accuracy: location.coords.accuracy,
-    });
+    setLocalizacao(location.coords);
     setEndereco(enderecoConvertido);
   }
 
-  /**
-   * Salvar registro
-   */
   async function enviar() {
-    await AsyncStorage.setItem(
-      "registro_hoje",
-      JSON.stringify({
-        tipo: tipoRegistro,
-        data: hoje(),
-        horario: new Date().toLocaleTimeString(),
-        justificativa: justificar ? motivo : null,
+    try {
+      const usuarioStr = await AsyncStorage.getItem("usuario");
+      if (!usuarioStr) throw new Error("Usuário não encontrado");
+
+      const usuario = JSON.parse(usuarioStr);
+
+      const payload = {
+        funcionario_id: usuario.id,
+        foto_url: foto,
         localizacao,
         endereco,
-      }),
-    );
+        justificativa: justificar ? motivo : null,
+      };
 
-    alert(`Registro de ${tipoRegistro.toUpperCase()} realizado com sucesso`);
+      const response = await fetch(`${BACKEND_URL}/presenca`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        alert(data.error || "Erro ao registrar presença");
+        return;
+      }
+
+      alert(
+        `Registro de ${data.presenca.tipo.toUpperCase()} realizado com sucesso`,
+      );
+
+      setFoto(null);
+      setJustificar(false);
+      setMotivo("");
+      setLocalizacao(null);
+      setEndereco(null);
+
+      router.replace("/login");
+    } catch (err) {
+      console.error(err);
+      alert("Erro ao registrar presença");
+    }
   }
 
   function trocarCamera() {
@@ -189,8 +212,6 @@ export default function Presenca() {
             value={motivo}
             onChangeText={setMotivo}
             multiline
-            returnKeyType="done"
-            onSubmitEditing={Keyboard.dismiss}
           />
         )}
 
@@ -205,39 +226,16 @@ export default function Presenca() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    padding: 16,
-    backgroundColor: "#fff",
-  },
-
+  container: { flex: 1, padding: 16, backgroundColor: "#fff" },
   title: {
     fontSize: 22,
     fontWeight: "bold",
     textAlign: "center",
     marginBottom: 16,
   },
-
-  camera: {
-    width: "100%",
-    height: 300,
-    borderRadius: 8,
-    overflow: "hidden",
-  },
-
-  preview: {
-    width: "100%",
-    height: 300,
-    borderRadius: 8,
-    marginTop: 12,
-  },
-
-  row: {
-    flexDirection: "row",
-    gap: 12,
-    marginTop: 16,
-  },
-
+  camera: { width: "100%", height: 300, borderRadius: 8, overflow: "hidden" },
+  preview: { width: "100%", height: 300, borderRadius: 8, marginTop: 12 },
+  row: { flexDirection: "row", gap: 12, marginTop: 16 },
   button: {
     flex: 1,
     height: 48,
@@ -246,7 +244,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-
   switchButton: {
     height: 48,
     paddingHorizontal: 16,
@@ -254,12 +251,7 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     justifyContent: "center",
   },
-
-  switchText: {
-    color: "#fff",
-    fontWeight: "bold",
-  },
-
+  switchText: { color: "#fff", fontWeight: "bold" },
   buttonEnviar: {
     height: 48,
     backgroundColor: "#16a34a",
@@ -268,19 +260,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginTop: 16,
   },
-
-  buttonText: {
-    color: "#fff",
-    fontWeight: "bold",
-  },
-
+  buttonText: { color: "#fff", fontWeight: "bold" },
   justificativa: {
     marginTop: 16,
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
   },
-
   textArea: {
     borderWidth: 1,
     borderColor: "#cbd5e1",
@@ -288,6 +274,5 @@ const styles = StyleSheet.create({
     padding: 10,
     marginTop: 8,
     minHeight: 80,
-    textAlignVertical: "top",
   },
 });
